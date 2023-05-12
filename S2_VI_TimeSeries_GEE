@@ -1,0 +1,139 @@
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//                                                  S2 VI Time Series Analysis                                                                 //
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// Task: creating a Sentinel2 Time Series with different vegetation indices for savanna grass plots in Krüger Nationalpark from mid June to today. 
+
+
+// Import functions from supplementary script
+var Imported = require("users/svenjadobelmann1998/Savannagrass_NDVI_timeSeries:Functions_S2_NDVI");
+
+// Area of interest: savanna grass plots in the Kruger Nationalpark (South Africa)
+Map.centerObject(aoi,15);
+
+// Time of Interest (mid 2019 to current)
+var dateRange = ee.DateRange('2019-06-01', ee.Date(Date.now()));
+//print(dateRange.end(),"DR")
+
+// 1. LOAD AND FILTER IMAGE COLLECTION  ////////////////////////////////////////////////////////////////////////////////////////////
+
+// Sentinel 2 Image collection
+var S2_col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") // for scenes after 2022-01-25: shifts them to match older scenes
+                  .filterBounds(aoi) // filter to aoi 
+                  .filterDate(dateRange) // filter times of interest 
+                  .filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 10) // pre-filter clouds to get less cloudy images
+                  .map(Imported.maskS2clouds) // mask clouds
+                  .map(Imported.renameBandsS2) // rename bands 
+                  .map(Imported.applyBRDF) // BRDF Correction (Sun and illumination angles)
+                  .map(Imported.re_align) // re-align Pixel
+                  .map(function(image){return image.clip(aoi)}); // clip to aoi 
+                  
+
+// 2. ADDING INDIZES //////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Indices are added as single bands to the imageCollection
+var S2_col = S2_col
+            .map(Imported.savi) // Soil Adjusted Vegetation Index
+            //.map(Imported.ndvi) // Normalized difference vegetation index
+            //.map(Imported.evi) // Enhanced Vegetation Index
+            //.map(Imported.gndvi) // green ndvi
+            //.map(Imported.tvi) // Transformed vegetation Index
+            //.map(Imported.ipvi) // Infrared percentage vegetation index
+            //.map(Imported.cvi) //chlorophyl vegetation Index
+            
+// Only keep index-band to make compositing faster
+var S2_col = S2_col.select(['SAVI']); 
+
+
+// 3. MONTHLY COMPOSITE ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// create a monthly composite
+//create list of months from 1 to 12
+var months = ee.List.sequence(1, 12);//separate by years
+var years = ee.List.sequence(2019,2023,1);
+
+var S2_monthly = ee.ImageCollection.fromImages(
+  
+  // looping over the available years
+  years.map(function(y){
+    
+    // looping over the months
+    return months.map(function(m){
+      
+      // creating imageCollection within current year and months
+      var current_month = S2_col
+        .filter(ee.Filter.calendarRange(y, y, "year"))
+        .filter(ee.Filter.calendarRange(m, m,"month")); // filter over month
+      return current_month
+        .mean()
+        .set('year', y) // s
+        .set('month', m)
+        .set('date', ee.Date.fromYMD(y, ee.Number(m), 15)) // middle of the quarter, needed for chart
+        .set('No_of_images', current_month.size())
+        .set('List_of_images', current_month.toList(1000)); // count is required, 1000 just a number high enough
+    });
+  }).flatten()); // resolve nested collection
+
+
+
+//////////////////////////////////////////////////////////////////////////////
+
+// check number of pixel for the analysis (sample size) 
+var stats = S2_col.first().reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: aoi,
+  scale: 10,
+});
+print(stats, "no of pixel");
+
+
+/*
+// visualize first Image of collection
+var ndviParams = {min: -1, max: 1, palette: ['blue', 'white', 'green','pink', 'red', 'yellow','blue', 'white', 'green', 'black']};  
+Map.addLayer(S2_col.select("SAVI").first(), ndviParams, "First SAVI collection");
+*/
+
+// print Collection 
+print("Sentinel2 Collection", S2_col);
+print("Mosaicked collection", S2_monthly);
+
+
+// 4. TIME SERIES ANALYSIS ////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Chart for SAVI
+var chart_SAVI = ui.Chart.image.seriesByRegion({imageCollection: S2_col,
+                                      regions: aoi,
+                                      reducer: ee.Reducer.median(), // median reducer needs less computational power
+                                      scale: 10,  // reduce scale to 50 to need less comp. power 
+                                      //xProperty: 'system:index',
+                                      seriesProperty: 'Name'
+  })
+  //.setSeriesNames(['Reference (never burned)', 'Burned every August'])
+  .setOptions({
+    title: 'SAVI time series',
+    vAxis: {title: 'SAVI'},
+    hAxis: {title: 'Date'},
+    curveType: 'function',
+    lineWidth: 3
+  });
+
+print(chart_SAVI);
+
+// monthly SAVI chart
+var chart_SAVI_m = ui.Chart.image.seriesByRegion({imageCollection: S2_monthly,
+                                      regions: aoi,
+                                      reducer: ee.Reducer.median(), // median reducer needs less computational power
+                                      scale: 10,  // reduce scale to 50 to need less comp. power 
+                                      xProperty: 'date',
+                                      seriesProperty: 'Name'
+  })
+  .setOptions({
+    title: 'monthly SAVI time series',
+    vAxis: {title: 'SAVI'},
+    hAxis: {title: 'Date'},
+    curveType: 'function',
+    lineWidth: 3
+  });
+
+print(chart_SAVI_m);
