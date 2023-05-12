@@ -1,0 +1,337 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//---------- Exported functions for script https://code.earthengine.google.com/b071ffc086b2c231a46b3f2a3d357cca           //
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 1. Cloud and shadow mask                                                                                               //
+// 2. Rename Bands                                                                                                        // 
+// 3. Calculate Indices                                                                                                   //
+// 4. BRDF CORRECTION                                                                                                     //
+// 5. RE-ALIGNMENT                                                                                                        // 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// 1. CLOUD MASK //////////////////////////////////////////////////////////////////////////////////////////
+
+// Mask clouds and cloud shadow for Sentinel 
+exports.maskS2clouds = function(image) {
+  var qa = image.select('QA60');
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitValue = 1024;
+  var cirrusBitValue = 2048;
+ // create masks
+  var shadow_mask = qa.bitwiseAnd(cloudBitValue).eq(0);
+  var cloud_mask = qa.bitwiseAnd(cirrusBitValue).eq(0);
+  // combine masks.
+  var final_mask = shadow_mask.and(cloud_mask);
+  return image.updateMask(final_mask).divide(10000) // divide by 10000 to obtain reflectance
+  .copyProperties(image, ["system:time_start"]);
+};
+
+
+
+// 2. RENAME BANDS /////////////////////////////////////////////////////////////////////////////////////////
+
+// rename bands for Sentinel-2
+exports.renameBandsS2 = function (image) {
+    var bands = ['B2', 'B3', 'B4', 'B8A', 'B11', 'B12'];
+    var new_bands = ['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2'];
+    return image.select(bands).rename(new_bands);
+};
+
+
+
+// 3. INDICES ////////////////////////////////////////////////////////////////////////////////////////////
+
+// Function for NDVI
+exports.ndvi = function(image) {
+  var ndvi_var = image.expression(
+    "(NIR - R)/(NIR + R)", 
+    {NIR: image.select("NIR"), R: image.select("R"),});
+  return image.addBands(ndvi_var.rename('NDVI')).float();
+};
+
+
+// Function for SAVI
+exports.savi = function(image) {
+  var savi_var = image.expression(
+    "(NIR - RED) / (NIR + RED + 0.5) * (1.5)",
+    {NIR: image.select('NIR'), RED: image.select('R')});
+  return image.addBands(savi_var.rename("SAVI")).float();
+};
+
+
+// Function for GNDVI
+exports.gndvi = function(image){
+  var gndvi_var = image.expression(
+    "(NIR - G)/(NIR + G)",
+    {NIR:image.select("NIR"), G: image.select("G"),});
+    return image.addBands(gndvi_var.rename("GNDVI")).float();
+};
+
+//Function for EVI
+exports.evi = function(image){
+  var evi_var = image.expression(
+    "2.5 * ((NIR - R) / ((NIR + 6*R - 7.5*B) +1))",
+    {NIR:image.select("NIR"), R:image.select("R"), B:image.select("B"),});
+    return image.addBands(evi_var.rename("EVI")).float();
+};
+
+// Function for TVI
+exports.tvi = function(image){
+  var tvi_var = image.expression(
+    "sqrt(NDVI + 0.5)",
+    {NDVI: image.select("NDVI"),});
+    return image.addBands(tvi_var.rename("TVI")).float();
+};
+
+// Function for Infrared percentage vegetation index (IPVI)
+exports.ipvi = function(image){
+  var ipvi_var = image.expression(
+    "NIR / (NIR + R)",
+    {NIR:image.select("NIR"), R:image.select("R"),});
+    return image.addBands(ipvi_var.rename("IPVI")).float();
+};
+
+
+// Function for CVI
+exports.cvi = function(image){
+  var cvi_var = image.expression(
+    "(NIR/G)*(R/G)",
+    {NIR:image.select("NIR"), R:image.select("R"), G:image.select("G")});
+    return image.addBands(cvi_var.rename("CVI")).float();
+};
+
+
+// 4. BRDF CORRECTION ///////////////////////////////////////////////////////////////////////////////////////
+//Source: https://doi.org/10.3390/rs11070831
+
+// variables 
+var PI = ee.Number(3.14159265359);
+var MAX_SATELLITE_ZENITH = 7.5;
+var MAX_DISTANCE = 1000000;
+var UPPER_LEFT = 0;
+var LOWER_LEFT = 1;
+var LOWER_RIGHT = 2;
+var UPPER_RIGHT = 3;
+
+exports.applyBRDF = function(image){
+    var date = ee.Date(image.get('system:time_start'));
+    var footprint = ee.List(aoi.geometry().bounds().bounds().coordinates().get(0));
+    var angles =  getsunAngles(date, footprint); // see function getsunAngles
+    var sunAz = angles[0];
+    var sunZen = angles[1];
+  
+    var viewAz = azimuth(footprint); // see function azimuth
+    var viewZen = zenith(footprint); //see function zenit
+  
+  
+    var kval = _kvol(sunAz, sunZen, viewAz, viewZen);
+    var kvol = kval[0];
+    var kvol0 = kval[1];
+    var result = _apply(image, kvol.multiply(PI), kvol0.multiply(PI));
+  
+    return result;
+}
+
+// function to calculate sun angles
+function getsunAngles(date, footprint){
+  var jdp = date.getFraction('year');
+  var seconds_in_hour = 3600;
+  var  hourGMT = ee.Number(date.getRelative('second', 'day')).divide(seconds_in_hour);
+    
+  var latRad = ee.Image.pixelLonLat().select('latitude').multiply(PI.divide(180));
+  var longDeg = ee.Image.pixelLonLat().select('longitude');
+    
+  // Julian day proportion in radians
+  var jdpr = jdp.multiply(PI).multiply(2);
+    
+  var a = ee.List([0.000075, 0.001868, 0.032077, 0.014615, 0.040849]);
+  var meanSolarTime = longDeg.divide(15.0).add(ee.Number(hourGMT));
+  var localSolarDiff1 = value(a, 0)
+          .add(value(a, 1).multiply(jdpr.cos())) 
+          .subtract(value(a, 2).multiply(jdpr.sin())) 
+          .subtract(value(a, 3).multiply(jdpr.multiply(2).cos())) 
+          .subtract(value(a, 4).multiply(jdpr.multiply(2).sin()));
+
+  var localSolarDiff2 = localSolarDiff1.multiply(12 * 60);
+  
+  var localSolarDiff = localSolarDiff2.divide(PI);
+  var trueSolarTime = meanSolarTime 
+          .add(localSolarDiff.divide(60)) 
+          .subtract(12.0);
+    
+  // Hour as an angle;
+  var ah = trueSolarTime.multiply(ee.Number(MAX_SATELLITE_ZENITH * 2).multiply(PI.divide(180))) ;   
+  var b = ee.List([0.006918, 0.399912, 0.070257, 0.006758, 0.000907, 0.002697, 0.001480]);
+  var delta = value(b, 0) 
+        .subtract(value(b, 1).multiply(jdpr.cos())) 
+        .add(value(b, 2).multiply(jdpr.sin())) 
+        .subtract(value(b, 3).multiply(jdpr.multiply(2).cos())) 
+        .add(value(b, 4).multiply(jdpr.multiply(2).sin())) 
+        .subtract(value(b, 5).multiply(jdpr.multiply(3).cos())) 
+        .add(value(b, 6).multiply(jdpr.multiply(3).sin()));
+
+  var cosSunZen = latRad.sin().multiply(delta.sin()) 
+        .add(latRad.cos().multiply(ah.cos()).multiply(delta.cos()));
+  var sunZen = cosSunZen.acos();
+
+  // sun azimuth from south, turning west
+  var sinSunAzSW = ah.sin().multiply(delta.cos()).divide(sunZen.sin());
+  sinSunAzSW = sinSunAzSW.clamp(-1.0, 1.0);
+  
+  var cosSunAzSW = (latRad.cos().multiply(-1).multiply(delta.sin())
+                    .add(latRad.sin().multiply(delta.cos()).multiply(ah.cos()))) 
+                    .divide(sunZen.sin());
+  var sunAzSW = sinSunAzSW.asin();
+  
+  sunAzSW = where(cosSunAzSW.lte(0), sunAzSW.multiply(-1).add(PI), sunAzSW);
+  sunAzSW = where(cosSunAzSW.gt(0).and(sinSunAzSW.lte(0)), sunAzSW.add(PI.multiply(2)), sunAzSW);
+  
+  var sunAz = sunAzSW.add(PI);
+   // # Keep within [0, 2pi] range
+    sunAz = where(sunAz.gt(PI.multiply(2)), sunAz.subtract(PI.multiply(2)), sunAz);
+  
+  var footprint_polygon = ee.Geometry.Polygon(footprint);
+  sunAz = sunAz.clip(footprint_polygon);
+  sunAz = sunAz.rename(['sunAz']);
+  sunZen = sunZen.clip(footprint_polygon).rename(['sunZen']);
+  
+  return [sunAz, sunZen];
+}
+
+// function to calculate azimuth
+function azimuth(footprint){
+    function x(point){return ee.Number(ee.List(point).get(0))}
+    function  y(point){return ee.Number(ee.List(point).get(1))}
+    
+    var upperCenter = line_from_coords(footprint, UPPER_LEFT, UPPER_RIGHT).centroid().coordinates();
+    var lowerCenter = line_from_coords(footprint, LOWER_LEFT, LOWER_RIGHT).centroid().coordinates();
+    var slope = ((y(lowerCenter)).subtract(y(upperCenter))).divide((x(lowerCenter)).subtract(x(upperCenter)));
+    var slopePerp = ee.Number(-1).divide(slope);
+    var azimuthLeft = ee.Image(PI.divide(2).subtract((slopePerp).atan()));
+    return azimuthLeft.rename(['viewAz']);
+  }
+  
+// function to calculate zenith
+function zenith(footprint){
+    var leftLine = line_from_coords(footprint, UPPER_LEFT, LOWER_LEFT);
+    var rightLine = line_from_coords(footprint, UPPER_RIGHT, LOWER_RIGHT);
+    var leftDistance = ee.FeatureCollection(leftLine).distance(MAX_DISTANCE);
+    var rightDistance = ee.FeatureCollection(rightLine).distance(MAX_DISTANCE);
+    var viewZenith = rightDistance.multiply(ee.Number(MAX_SATELLITE_ZENITH * 2)) 
+          .divide(rightDistance.add(leftDistance)) 
+          .subtract(ee.Number(MAX_SATELLITE_ZENITH)) 
+          .clip(ee.Geometry.Polygon(footprint)) 
+          .rename(['viewZen']);
+    return viewZenith.multiply(PI.divide(180));
+}
+
+// function to apply other functions on the image 
+function _apply(image, kvol, kvol0){
+      var f_iso = 0;
+      var f_geo = 0;
+      var f_vol = 0;
+			var B = _correct_band(image, 'B', kvol, kvol0, f_iso=0.0774, f_geo=0.0079, f_vol=0.0372); // see function  _correct_band
+			var G = _correct_band(image, 'G', kvol, kvol0, f_iso=0.1306, f_geo=0.0178, f_vol=0.0580);
+			var R = _correct_band(image, 'R', kvol, kvol0, f_iso=0.1690, f_geo=0.0227, f_vol=0.0574);
+      var NIR = _correct_band(image, 'NIR', kvol, kvol0, f_iso=0.3093, f_geo=0.0330, f_vol=0.1535);
+      var SWIR1 = _correct_band(image, 'SWIR1', kvol, kvol0, f_iso=0.3430, f_geo=0.0453, f_vol=0.1154);   
+			return image.select([]).addBands([B, G, R, NIR,SWIR1,]);
+}
+
+// function to correct band
+function _correct_band(image, band_name, kvol, kvol0, f_iso, f_geo, f_vol){
+	//"""fiso + fvol * kvol + fgeo * kgeo"""
+	var iso = ee.Image(f_iso);
+	var geo = ee.Image(f_geo);
+	var vol = ee.Image(f_vol);
+	var pred = vol.multiply(kvol).add(geo.multiply(kvol)).add(iso).rename(['pred']);
+	var pred0 = vol.multiply(kvol0).add(geo.multiply(kvol0)).add(iso).rename(['pred0']);
+	var cfac = pred0.divide(pred).rename(['cfac']);
+	var corr = image.select(band_name).multiply(cfac).rename([band_name]);
+	return corr;
+}
+
+// function to calculate kvol kernel 
+function _kvol(sunAz, sunZen, viewAz, viewZen){
+	//"""Calculate kvol kernel.
+	//From Lucht et al. 2000
+	//Phase angle = cos(solar zenith) cos(view zenith) + sin(solar zenith) sin(view zenith) cos(relative azimuth)"""
+			
+	var relative_azimuth = sunAz.subtract(viewAz).rename(['relAz']);
+	var pa1 = viewZen.cos().multiply(sunZen.cos());
+	var pa2 = viewZen.sin().multiply(sunZen.sin()).multiply(relative_azimuth.cos());
+	var phase_angle1 = pa1.add(pa2);
+	var phase_angle = phase_angle1.acos();
+	var p1 = ee.Image(PI.divide(2)).subtract(phase_angle);
+	var p2 = p1.multiply(phase_angle1);
+	var p3 = p2.add(phase_angle.sin());
+	var p4 = sunZen.cos().add(viewZen.cos());
+	var p5 = ee.Image(PI.divide(4));
+
+	var kvol = p3.divide(p4).subtract(p5).rename(['kvol']);
+
+	var viewZen0 = ee.Image(0);
+	var pa10 = viewZen0.cos().multiply(sunZen.cos());
+	var pa20 = viewZen0.sin().multiply(sunZen.sin()).multiply(relative_azimuth.cos());
+	var phase_angle10 = pa10.add(pa20);
+	var phase_angle0 = phase_angle10.acos();
+	var p10 = ee.Image(PI.divide(2)).subtract(phase_angle0);
+	var p20 = p10.multiply(phase_angle10);
+	var p30 = p20.add(phase_angle0.sin());
+	var p40 = sunZen.cos().add(viewZen0.cos());
+	var p50 = ee.Image(PI.divide(4));
+
+	var kvol0 = p30.divide(p40).subtract(p50).rename(['kvol0']);
+
+	return [kvol, kvol0];
+}
+	
+// function to get line from coordinates
+function line_from_coords(coordinates, fromIndex, toIndex){
+    return ee.Geometry.LineString(ee.List([
+      coordinates.get(fromIndex),
+      coordinates.get(toIndex)]));
+}
+
+// where function
+function where(condition, trueValue, falseValue){
+  var trueMasked = trueValue.mask(condition);
+  var falseMasked = falseValue.mask(invertMask(condition));
+      return trueMasked.unmask(falseMasked);
+}
+
+// invert mask function
+function invertMask(mask){
+    return mask.multiply(-1).add(1);
+}
+
+// value function 
+function value(list,index){
+    return ee.Number(list.get(index));
+}
+
+
+// 5. RE-ALIGNMENT ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// function to re-align images
+exports.re_align = function(image){
+  
+  var S2_col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") // for scenes after 2022-01-25: shifts them to match older scenes
+                  .filterBounds(aoi) // filter to aoi 
+                  .filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 10); // pre-filter clouds to get less cloudy images
+      
+  var listOfImages = S2_col.select("B4").toList(S2_col.size()); // select only red band to align images 
+                  
+  var img = image.select("R"); // select only red band for registering
+  var displacement = img.displacement({
+    referenceImage: listOfImages.get(0),
+    maxOffset: 50.0,//The maximum offset allowed when attempting to align the input images, in meters
+    patchWidth: 100.0 // Small enough to capture texture and large enough that ignorable 
+    //objects are small within the patch. Automatically ditermined if not provided 
+  });
+  var img_aligned = image.displace(displacement);
+  return img_aligned;
+};
+
+
