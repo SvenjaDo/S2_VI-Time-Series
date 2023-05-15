@@ -19,7 +19,7 @@ library(pals) # for color palette
 
 
 ## import data sheets  
-setwd("C:/Users/49152/Documents/Universitas/Master_EAGLE/Intern_Krueger/VeggyBox/Paper/results/data_tables")
+setwd("/data_tables/")
 
 savi <- read.csv("SAVI_monthly_median.csv", sep = ",", header = T)
 std <- read.csv("SAVI_monthly_stdDev.csv", sep = ",", header = T)
