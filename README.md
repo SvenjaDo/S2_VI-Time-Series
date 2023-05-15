@@ -9,3 +9,7 @@ A full time series as well as a monthly time series is created. The results can 
 # TS_ggplot
 
 This script is used to visualize the time Series results. Inputs are .csv results downloaded from Google Earth Engine as well as precipitation data for the corresponding area. The results will be shown in a Time Series Plot showing the measurements for the 14 Aoi´s as well as rainfall data as a barplot. A smoothing function over all Aois can be added. 
+
+
+![Time Series Plot]([url](https://github.com/SvenjaDo/S2_VI-Time-Series/blob/main/results/SAVI_TS_median_prec.pdf) "Time Series Plot")
+
